@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 from bs4 import BeautifulSoup
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver import ChromeOptions as Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -18,8 +18,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 # ── Constants ────────────────────────────────────────────────────────────────
 GM_WEBPAGE = 'https://www.google.com/maps/'
-MAX_WAIT = 10
-MAX_RETRY = 5
+MAX_WAIT   = 10
+MAX_RETRY  = 5
 MAX_SCROLLS = 40
 
 # Selectors — update here if Google changes the DOM
@@ -34,17 +34,48 @@ NREVIEWS_DIV_CSS    = 'div.RfnDt'
 USER_BUTTON_CSS     = 'button.WEBjve'
 EXPAND_BUTTON_CSS   = 'button.w8nwRe.kyuRq'
 SCROLL_DIV_CSS      = 'div.m6QErb.DxyBCb.kA9KIf.dS8AEf'
+PLACE_NAME_CSS      = 'h1.DUwDvf'
 
 # User-agent for anti-bot headers
 UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36')
+
+# ── Timing constants ──────────────────────────────────────────────────────────
+# Normal mode: conservative waits — reliable across slow connections
+AJAX_TIMEOUT_NORMAL    = 8    # max seconds to wait for new reviews after a scroll
+SORT_RELOAD_TIMEOUT    = 12   # max seconds to wait for reviews to reload after sort change
+ACCOUNT_WAIT_TIMEOUT   = 10   # max seconds to wait for place h1 to appear
+RETRY_SLEEP_NORMAL     = 1.0  # sleep between sort-button retry attempts
+SORT_FALLBACK_SLEEP    = 2.0  # fallback sleep if dynamic sort-reload wait fails
+PLACES_FALLBACK_SLEEP  = 1.0  # fallback sleep per search point in get_places()
+
+# Turbo mode: tighter waits — faster but may miss slow-loading content
+AJAX_TIMEOUT_TURBO     = 5
+SORT_RELOAD_TIMEOUT_TURBO  = 8
+ACCOUNT_WAIT_TIMEOUT_TURBO = 6
+RETRY_SLEEP_TURBO      = 0.5
+SORT_FALLBACK_SLEEP_TURBO  = 1.0
+PLACES_FALLBACK_SLEEP_TURBO = 0.3
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 class GoogleMapsScraper:
 
-    def __init__(self, debug=False):
-        self.debug = debug
+    def __init__(self, debug=False, turbo=False):
+        self.debug  = debug
+        self.turbo  = turbo
+
+        # Resolve per-instance timing based on mode
+        self._ajax_timeout         = AJAX_TIMEOUT_TURBO    if turbo else AJAX_TIMEOUT_NORMAL
+        self._sort_reload_timeout  = SORT_RELOAD_TIMEOUT_TURBO if turbo else SORT_RELOAD_TIMEOUT
+        self._account_wait_timeout = ACCOUNT_WAIT_TIMEOUT_TURBO if turbo else ACCOUNT_WAIT_TIMEOUT
+        self._retry_sleep          = RETRY_SLEEP_TURBO     if turbo else RETRY_SLEEP_NORMAL
+        self._sort_fallback_sleep  = SORT_FALLBACK_SLEEP_TURBO if turbo else SORT_FALLBACK_SLEEP
+        self._places_fallback_sleep = PLACES_FALLBACK_SLEEP_TURBO if turbo else PLACES_FALLBACK_SLEEP
+
+        # Track seen review IDs to avoid re-processing duplicates across scroll batches
+        self._seen_ids = set()
+
         self.driver = self.__get_driver()
         self.logger = self.__get_logger()
 
@@ -58,7 +89,12 @@ class GoogleMapsScraper:
         self.driver.quit()
         return True
 
+    # ── Public API ────────────────────────────────────────────────────────────
+
     def sort_by(self, url, ind):
+        # Reset seen-ID tracking for this URL
+        self._seen_ids.clear()
+
         self.driver.get(url.strip())
         self.__click_on_cookie_agreement()
 
@@ -71,20 +107,27 @@ class GoogleMapsScraper:
 
         # Click the sort dropdown
         clicked = False
-        tries = 0
+        tries   = 0
         while not clicked and tries < MAX_RETRY:
             try:
                 menu_bt = wait.until(EC.element_to_be_clickable((By.XPATH, SORT_BUTTON_XPATH)))
                 menu_bt.click()
                 clicked = True
-                time.sleep(3)
             except Exception as e:
                 tries += 1
                 self.logger.warning('Sort button not found (attempt %d/%d): %s', tries, MAX_RETRY, e)
+                time.sleep(self._retry_sleep)
 
         if not clicked:
             self.logger.error('Could not click sort button after %d attempts for: %s', MAX_RETRY, url.strip())
             return -1
+
+        # Wait for sort option items to become visible
+        try:
+            WebDriverWait(self.driver, MAX_WAIT).until(
+                EC.visibility_of_element_located((By.XPATH, SORT_OPTION_XPATH)))
+        except TimeoutException:
+            self.logger.warning('Sort options did not become visible; proceeding anyway')
 
         # Select the desired sort option by position index
         options = self.driver.find_elements(By.XPATH, SORT_OPTION_XPATH)
@@ -96,23 +139,72 @@ class GoogleMapsScraper:
             return -1
 
         options[ind].click()
-        time.sleep(5)
+
+        # Wait for reviews to reload with the new sort order
+        self.__wait_for_sort_reload()
         return 0
 
-    def __open_reviews_tab(self, wait):
-        """Click the Reviews/Opiniones tab. Returns True on success."""
+    def get_reviews(self, offset):
+        # Count reviews currently in DOM before scrolling
+        before_count = len(self.driver.find_elements(By.CSS_SELECTOR, REVIEW_BLOCK_CSS))
+
+        # Scroll to trigger lazy-loading of the next batch
+        self.__scroll()
+
+        # Dynamic wait: block until new review cards appear (or timeout)
         try:
-            tab = wait.until(EC.element_to_be_clickable((By.XPATH, REVIEWS_TAB_XPATH)))
-            self.logger.info('Clicking reviews tab: %s', tab.text)
-            tab.click()
-            time.sleep(3)
-            return True
-        except Exception as e:
-            self.logger.warning('Reviews tab not clickable: %s', e)
-            return False
+            WebDriverWait(self.driver, self._ajax_timeout).until(
+                lambda d: len(d.find_elements(By.CSS_SELECTOR, REVIEW_BLOCK_CSS)) > before_count
+            )
+        except TimeoutException:
+            # No new reviews loaded — either end of list or very slow network
+            pass
+
+        # Expand truncated review text
+        self.__expand_reviews()
+
+        response = BeautifulSoup(self.driver.page_source, 'html.parser')
+        rblock = response.find_all('div', class_='jftiEf fontBodyMedium')
+        if not rblock:
+            self.logger.warning('No review blocks found (class jftiEf fontBodyMedium)')
+
+        parsed_reviews = []
+        for index, review in enumerate(rblock):
+            # Skip already-processed reviews (by position offset)
+            if index < offset:
+                continue
+
+            r = self.__parse(review)
+
+            # Dedup by review ID across multiple get_reviews() calls for the same URL
+            rid = r.get('id_review')
+            if rid:
+                if rid in self._seen_ids:
+                    continue
+                self._seen_ids.add(rid)
+
+            parsed_reviews.append(r)
+            print(r)
+
+        return parsed_reviews
+
+    # Needs a different URL than the reviews URL to get all place info
+    def get_account(self, url):
+        self.driver.get(url.strip())
+        self.__click_on_cookie_agreement()
+
+        # Wait for the place name heading — more reliable than a fixed sleep
+        try:
+            WebDriverWait(self.driver, self._account_wait_timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, PLACE_NAME_CSS)))
+        except TimeoutException:
+            pass  # proceed with whatever has loaded
+
+        resp = BeautifulSoup(self.driver.page_source, 'html.parser')
+        return self.__parse_place(resp, url.strip())
 
     def get_places(self, keyword_list=None):
-
+        keyword_list = [] if keyword_list is None else keyword_list
         df_places = pd.DataFrame()
         search_point_url_list = self._gen_search_points_from_square(keyword_list=keyword_list)
 
@@ -137,7 +229,13 @@ class GoogleMapsScraper:
             for _ in range(10):
                 self.driver.execute_script('arguments[0].scrollTop = arguments[0].scrollHeight', scrollable_div)
 
-            time.sleep(2)
+            # Dynamic wait for place links — fallback to short sleep
+            try:
+                WebDriverWait(self.driver, self._ajax_timeout).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'div[jsaction] > a[href]')))
+            except TimeoutException:
+                time.sleep(self._places_fallback_sleep)
+
             response = BeautifulSoup(self.driver.page_source, 'html.parser')
             div_places = response.select('div[jsaction] > a[href]')
 
@@ -154,37 +252,40 @@ class GoogleMapsScraper:
         df_places = df_places[['search_point_url', 'href', 'name']]
         df_places.to_csv('output/places_wax.csv', index=False)
 
-    def get_reviews(self, offset):
-        # Scroll to load more reviews
-        self.__scroll()
+    # ── Private helpers ───────────────────────────────────────────────────────
 
-        # Wait for AJAX reviews to render
-        time.sleep(4)
+    def __open_reviews_tab(self, wait):
+        """Click the Reviews/Opiniones tab and wait for the sort button to be present."""
+        try:
+            tab = wait.until(EC.element_to_be_clickable((By.XPATH, REVIEWS_TAB_XPATH)))
+            self.logger.info('Clicking reviews tab: %s', tab.text)
+            tab.click()
+            # Wait for the sort button to appear — proof that the reviews panel is active
+            WebDriverWait(self.driver, MAX_WAIT).until(
+                EC.presence_of_element_located((By.XPATH, SORT_BUTTON_XPATH)))
+            return True
+        except Exception as e:
+            self.logger.warning('Reviews tab not clickable or sort button not found: %s', e)
+            return False
 
-        # Expand truncated review text
-        self.__expand_reviews()
+    def __wait_for_sort_reload(self):
+        """
+        Wait for the reviews list to reload after a sort-option click.
 
-        response = BeautifulSoup(self.driver.page_source, 'html.parser')
-        rblock = response.find_all('div', class_='jftiEf fontBodyMedium')
-        if not rblock:
-            self.logger.warning('No review blocks found (class jftiEf fontBodyMedium)')
-
-        parsed_reviews = []
-        for index, review in enumerate(rblock):
-            if index >= offset:
-                r = self.__parse(review)
-                parsed_reviews.append(r)
-                print(r)
-
-        return parsed_reviews
-
-    # Needs a different URL than the reviews URL to get all place info
-    def get_account(self, url):
-        self.driver.get(url.strip())
-        self.__click_on_cookie_agreement()
-        time.sleep(2)
-        resp = BeautifulSoup(self.driver.page_source, 'html.parser')
-        return self.__parse_place(resp, url.strip())
+        Strategy: capture a reference to the first review block, click, then wait for
+        that element to go stale (page re-rendered) and for a fresh block to appear.
+        Falls back to a short fixed sleep when no review blocks are present yet.
+        """
+        sort_wait = WebDriverWait(self.driver, self._sort_reload_timeout)
+        try:
+            first_review = self.driver.find_element(By.CSS_SELECTOR, REVIEW_BLOCK_CSS)
+            # Wait for the DOM node to become stale (Google replaced it)
+            sort_wait.until(EC.staleness_of(first_review))
+            # Wait for the freshly-sorted reviews to appear
+            sort_wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, REVIEW_BLOCK_CSS)))
+        except (NoSuchElementException, TimeoutException):
+            # No review blocks yet, or staleness check timed out — use fallback
+            time.sleep(self._sort_fallback_sleep)
 
     def __parse(self, review):
         item = {}
@@ -227,16 +328,16 @@ class GoogleMapsScraper:
         except Exception:
             user_url = None
 
-        item['id_review'] = id_review
-        item['caption'] = review_text
-        item['relative_date'] = relative_date
-        item['review_date'] = self.__calculate_review_date(relative_date, retrieval_date)
+        item['id_review']      = id_review
+        item['caption']        = review_text
+        item['relative_date']  = relative_date
+        item['review_date']    = self.__calculate_review_date(relative_date, retrieval_date)
         item['retrieval_date'] = retrieval_date
-        item['rating'] = rating
-        item['username'] = username
-        item['n_review_user'] = n_reviews
-        item['n_photo_user'] = None   # field kept for schema compatibility; no longer available
-        item['url_user'] = user_url
+        item['rating']         = rating
+        item['username']       = username
+        item['n_review_user']  = n_reviews
+        item['n_photo_user']   = None   # kept for schema compatibility; no longer available
+        item['url_user']       = user_url
 
         return item
 
@@ -245,8 +346,8 @@ class GoogleMapsScraper:
         if not relative_date_str:
             return retrieval_date
         try:
-            s = relative_date_str.replace('Editado ', '').strip()
-            m = re.search(r'(\d+)', s)
+            s  = relative_date_str.replace('Editado ', '').strip()
+            m  = re.search(r'(\d+)', s)
             if m:
                 value = int(m.group(1))
             elif re.search(r'\bun[ao]?\b', s, re.I):
@@ -255,20 +356,13 @@ class GoogleMapsScraper:
                 return retrieval_date
 
             sl = s.lower()
-            if 'segundo' in sl:
-                return retrieval_date - timedelta(seconds=value)
-            elif 'minuto' in sl:
-                return retrieval_date - timedelta(minutes=value)
-            elif 'hora' in sl:
-                return retrieval_date - timedelta(hours=value)
-            elif 'día' in sl:
-                return retrieval_date - timedelta(days=value)
-            elif 'semana' in sl:
-                return retrieval_date - timedelta(weeks=value)
-            elif 'mes' in sl:
-                return retrieval_date - timedelta(days=value * 30)
-            elif 'año' in sl:
-                return retrieval_date - timedelta(days=value * 365)
+            if   'segundo' in sl: return retrieval_date - timedelta(seconds=value)
+            elif 'minuto'  in sl: return retrieval_date - timedelta(minutes=value)
+            elif 'hora'    in sl: return retrieval_date - timedelta(hours=value)
+            elif 'día'     in sl: return retrieval_date - timedelta(days=value)
+            elif 'semana'  in sl: return retrieval_date - timedelta(weeks=value)
+            elif 'mes'     in sl: return retrieval_date - timedelta(days=value * 30)
+            elif 'año'     in sl: return retrieval_date - timedelta(days=value * 365)
             else:
                 return retrieval_date
         except (ValueError, IndexError):
@@ -326,10 +420,10 @@ class GoogleMapsScraper:
 
         try:
             lat, long, _ = url.split('/')[6].split(',')
-            place['lat'] = lat[1:]
+            place['lat']  = lat[1:]
             place['long'] = long
         except Exception:
-            place['lat'] = None
+            place['lat']  = None
             place['long'] = None
 
         return place
@@ -341,7 +435,7 @@ class GoogleMapsScraper:
         search_urls = []
         for city in cities:
             df_aux = square_points[square_points['city'] == city]
-            latitudes = df_aux['latitude'].unique()
+            latitudes  = df_aux['latitude'].unique()
             longitudes = df_aux['longitude'].unique()
             coordinates_list = list(itertools.product(latitudes, longitudes, keyword_list))
             search_urls += [
@@ -367,7 +461,7 @@ class GoogleMapsScraper:
             self.logger.warning('Scrollable reviews div not found (%s)', SCROLL_DIV_CSS)
 
     def __get_logger(self):
-        logger = logging.getLogger('googlemaps-scraper')
+        logger = logging.getLogger(f'googlemaps-scraper-{id(self)}')
         logger.setLevel(logging.DEBUG)
         fh = logging.FileHandler('gm-scraper.log')
         fh.setLevel(logging.DEBUG)
@@ -394,6 +488,21 @@ class GoogleMapsScraper:
         options.add_experimental_option('excludeSwitches', ['enable-automation'])
         options.add_experimental_option('useAutomationExtension', False)
         options.add_argument(f'--user-agent={UA}')
+
+        if self.turbo:
+            # Block image loading — saves significant bandwidth and CPU per page
+            prefs = {
+                'profile.managed_default_content_settings.images': 2,
+                'profile.default_content_settings.images': 2,
+            }
+            options.add_experimental_option('prefs', prefs)
+            # Eager strategy: don't wait for images/fonts — return as soon as DOM is ready
+            options.page_load_strategy = 'eager'
+            options.add_argument('--disable-extensions')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--disable-software-rasterizer')
+            options.add_argument('--disable-default-apps')
+            options.add_argument('--no-first-run')
 
         driver = webdriver.Chrome(service=Service(), options=options)
 
