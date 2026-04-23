@@ -35,6 +35,7 @@ The scraper has two execution modes. The right choice depends on how many URLs y
 | `--source` | flag | off | — | Append an extra `url_source` column to the CSV. Useful when scraping many URLs in one run. |
 | `--workers` | int | `1` (normal) / `4` (turbo) | ≥ 1 | Number of parallel Chrome browsers. Each worker processes one URL at a time. Setting `--workers 1` forces single-threaded mode even with `--turbo`. |
 | `--turbo` | flag | off | — | **Mode B.** Enables browser performance flags (images disabled, eager page-load strategy) and raises the default worker count to 4. Accepts higher rate-limit risk. |
+| `--log` | str | `scraper_YYYYMMDD_HHMMSS.log` | any filename | Log file path. Written in the current working directory. Defaults to a timestamped filename so each run gets its own log. |
 
 ### Speed vs stability tradeoffs
 
@@ -48,6 +49,72 @@ The scraper has two execution modes. The right choice depends on how many URLs y
 ```
 
 > **RAM budget:** each Chrome instance uses roughly 200–400 MB in headless mode. With `--turbo` (images disabled) this drops to ~150–250 MB. Do not exceed `floor(free_RAM_GB / 0.3)` workers.
+
+---
+
+## Fault Tolerance
+
+### Incremental CSV writing
+
+The output file is opened in **append mode** from the very first write. Every scroll batch is flushed to disk immediately after being written. This means:
+
+- **Crash or Ctrl-C mid-run**: all reviews extracted before the crash are already in the file. Nothing is lost.
+- **Resuming a partial run**: re-run with the same `--o` file. Because the file is opened in append mode and the header is only written to empty files, rows will be appended without duplicating the header.
+- **Deduplication on resume**: the output CSV may contain duplicate rows if the same URL is scraped again on resume. Post-process with `pandas.DataFrame.drop_duplicates(subset=['id_review'])` to clean.
+
+### Logging system
+
+Each run produces a structured log file (default: `scraper_YYYYMMDD_HHMMSS.log`).
+
+**Per-URL log lines** (always written):
+
+```
+2026-04-22 10:35:01  INFO      [#0001] STARTED   https://maps.google.com/...
+2026-04-22 10:35:44  INFO      [#0001] COMPLETED  https://...  reviews=47
+2026-04-22 10:36:10  WARNING   [#0002] SKIPPED   https://...  reason=sort_by_failed
+2026-04-22 10:36:55  WARNING   [#0003] FAILED    https://...  error=TimeoutException(...)
+```
+
+**Per-batch debug lines** (file only, not console):
+
+```
+2026-04-22 10:35:12  DEBUG     [#0001] batch  offset=0  size=10
+2026-04-22 10:35:22  DEBUG     [#0001] batch  offset=10  size=10
+```
+
+**Full tracebacks** (file only, DEBUG level):
+
+```
+2026-04-22 10:36:55  DEBUG     [#0003] TRACEBACK:
+Traceback (most recent call last):
+  ...
+selenium.common.exceptions.TimeoutException: ...
+```
+
+**End-of-run summary** (both console and file):
+
+```
+──────────────────────────────────────────────────────────────────
+RUN SUMMARY
+  Input entries  total    : 10
+  Completed               : 8
+  Failed                  : 1
+  Skipped                 : 1
+  Total reviews written   : 742
+  Last completed line (#) : 9
+  Elapsed time            : 0:14:33
+  Log file                : scraper_20260422_103501.log
+  FAILED  line(s) (#)     : 3
+  SKIPPED line(s) (#)     : 7
+
+  RESUME HINT: 2 line(s) need attention.
+  Extract those lines from the input file and re-run:
+    grep -n "" urls.txt | grep -E "^(3|7):" | cut -d: -f2- > retry.txt
+    python3 scraper.py --i retry.txt ...
+──────────────────────────────────────────────────────────────────
+```
+
+**Line numbers** in all log messages refer to the actual 1-indexed line position in the input file (blank lines included in the count), making it unambiguous which entries to re-run.
 
 ---
 

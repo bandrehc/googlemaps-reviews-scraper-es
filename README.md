@@ -69,8 +69,9 @@ python3 scraper.py [options]
 | `--source` | flag | off | Append an extra `url_source` column to the CSV |
 | `--workers` | int | `1` (normal) / `4` (turbo) | Number of parallel Chrome browsers |
 | `--turbo` | flag | off | Mode B: aggressive parallelisation + browser optimisations |
+| `--log` | str | `scraper_YYYYMMDD_HHMMSS.log` | Log file path (timestamped per run by default) |
 
-See [HYPERPARAMETERS.md](HYPERPARAMETERS.md) for the full parameter reference including internal timing constants.
+See [HYPERPARAMETERS.md](HYPERPARAMETERS.md) for the full parameter reference including internal timing constants and the logging/fault-tolerance system.
 
 ---
 
@@ -198,6 +199,49 @@ python3 monitor.py --i urls.txt --from-date 2025-01-01
 
 ---
 
+## Fault tolerance and observability
+
+### Incremental output — crash-safe
+
+The output CSV is opened in **append mode** at startup. Every scroll batch (~10 reviews) is flushed to disk immediately after extraction. If the process is killed or crashes:
+
+- All reviews written before the crash are already in the file — nothing is lost.
+- Re-run with the same `--o` file to append the missing entries (no duplicate header, no data loss).
+- To deduplicate after a double-run: `pandas.read_csv(...).drop_duplicates(subset=['id_review']).to_csv(...)`
+
+### Logging
+
+Every run writes a structured log to `scraper_YYYYMMDD_HHMMSS.log` (or a custom path via `--log`).
+
+Log levels:
+- **Console (INFO+)**: one line per URL — STARTED, COMPLETED, SKIPPED, FAILED — and the end-of-run summary.
+- **File (DEBUG+)**: adds per-batch progress lines and full exception tracebacks for every FAILED entry.
+
+**Line numbers** in log messages match the 1-indexed line position in the input file, making it unambiguous which entries failed.
+
+**End-of-run summary** (printed to both console and file):
+
+```
+──────────────────────────────────────────────────────────────────
+RUN SUMMARY
+  Input entries  total    : 10
+  Completed               : 8
+  Failed                  : 1
+  Skipped                 : 1
+  Total reviews written   : 742
+  Last completed line (#) : 9
+  Elapsed time            : 0:14:33
+  FAILED  line(s) (#)     : 3
+  SKIPPED line(s) (#)     : 7
+
+  RESUME HINT: 2 line(s) need attention.
+    grep -n "" urls.txt | grep -E "^(3|7):" | cut -d: -f2- > retry.txt
+    python3 scraper.py --i retry.txt ...
+──────────────────────────────────────────────────────────────────
+```
+
+---
+
 ## Performance notes
 
 ### What was optimised
@@ -248,6 +292,17 @@ Each headless Chrome instance uses ~200–400 MB. With `--turbo` (images blocked
 ---
 
 ## Changelog
+
+### 2026-04-22
+
+**Fault tolerance and logging**
+
+- **Incremental CSV writing**: output file is now opened in append mode (`'a'`). Each scroll batch (~10 reviews) is flushed to disk immediately after extraction. A crash or Ctrl-C at any point leaves a valid, fully-written CSV up to that moment. Header is written only when the file is new or empty, so re-runs safely append without duplicate headers.
+- **Structured logging** (`setup_logger`): dual-handler logger writes to both console (INFO+) and a timestamped log file (DEBUG+). Per-URL status lines (`STARTED`, `COMPLETED`, `SKIPPED`, `FAILED`) carry 1-indexed input-file line numbers so failures map directly back to the input.
+- **`RunStats`**: thread-safe counter class accumulates completed/failed/skipped counts and per-category line lists across workers.
+- **End-of-run summary**: printed to both console and log file — total entries, per-status counts, total reviews written, elapsed time, explicit line numbers for every failed/skipped entry, and a ready-to-paste `grep` command to build a retry input file.
+- **`--log`**: new CLI flag to specify a custom log filename (default: `scraper_YYYYMMDD_HHMMSS.log`).
+- **`print(r)` removed** from `googlemaps.get_reviews()`: per-review dict printing was noisy and redundant given the new logging layer. Batch progress is now logged at DEBUG level from `scraper.py`.
 
 ### 2026-04-21
 

@@ -184,7 +184,6 @@ class GoogleMapsScraper:
                 self._seen_ids.add(rid)
 
             parsed_reviews.append(r)
-            print(r)
 
         return parsed_reviews
 
